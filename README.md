@@ -40,7 +40,7 @@ file. Its few options are all passed on the command line:
 
 ## Where can I use it?
 
-`gawsh` should generally run anywhere a Rust 1.51+ compiler can target against
+`gawsh` should generally run anywhere a Rust 1.55+ compiler can target, against
 any Git repository `libgit2` can understand, and its output is plain UTF-8 text
 you can upload to just about anywhere you want. Yep, even that FTP host you
 last used in 1999. It doesn't integrate with any CI systems or, for example,
@@ -63,9 +63,8 @@ you're free to use it for any purpose, in any context, and without letting me
 know.
 
 Contributions will be considered, but are not guaranteed to be merged for any
-reason or no reason at all. By submitting a contribution to `gawsh`, you
-assert the following (this is the [Unlicense
-waiver](https://unlicense.org/WAIVER)):
+reason or no reason at all. By submitting a contribution to `gawsh`, you assert
+the following (this is the [Unlicense waiver](https://unlicense.org/WAIVER)):
 
 > I dedicate any and all copyright interest in this software to the
 > public domain. I make this dedication for the benefit of the public at
