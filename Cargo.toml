@@ -10,12 +10,10 @@ anyhow = "1.0"
 argh = "0.1"
 colog = "1.1"
 console = "0.14"
-dashmap = "4.0"
+dashmap = { version = "4.0", features = ["rayon"] }
 git2 = { version = "0.13", default_features = false }
-indexmap = "1.7"
 log = "0.4"
-num_cpus = "1.13"
-threadpool = "1.8"
+rayon = "1.5"
 
 [dependencies.syntect]
 version = "4.6"
