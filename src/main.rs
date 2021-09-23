@@ -8,6 +8,7 @@ extern crate git2;
 extern crate log;
 extern crate rayon;
 extern crate syntect;
+extern crate thread_local;
 
 use anyhow::Result;
 use argh::{FromArgValue, FromArgs};
@@ -22,6 +23,7 @@ use syntect::highlighting::ThemeSet;
 use syntect::html::{css_for_theme_with_class_style, ClassStyle, ClassedHTMLGenerator};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
+use thread_local::ThreadLocal;
 
 /// gawsh generates a static HTML portrait of a Git repository
 #[derive(FromArgs, PartialEq, Debug)]
@@ -129,7 +131,7 @@ fn main() -> Result<()> {
 // that are actually referenced in commits we actually need to render, and then queue up jobs
 // for each of those objects
 fn referenced_oids_and_paths(repo: &Repository, repo_path: &str) -> Result<ReferencedOids> {
-    let broken_oids = DashSet::new();
+    let all_oids = DashSet::new();
     let relevant_oids = DashMap::new();
     let fname_cache = DashMap::new();
     let revwalk = {
@@ -137,6 +139,7 @@ fn referenced_oids_and_paths(repo: &Repository, repo_path: &str) -> Result<Refer
         revwalk.push_head()?;
         revwalk
     };
+    let tl = ThreadLocal::new();
 
     // libgit2 isn't threadsafe as a general rule, so git2-rs likewise doesn't implement Send
     // for... anything. so this is our hack: take the OID objects, serialize them to 20-byte u8
@@ -150,10 +153,7 @@ fn referenced_oids_and_paths(repo: &Repository, repo_path: &str) -> Result<Refer
         .collect::<Vec<Vec<u8>>>() // no impl for Map<Revwalk...> to rayon::IntoParallelRefIterator
         .par_iter()
         .for_each(|rev| {
-            let repo = match Repository::open(repo_path) {
-                Ok(repo) => repo,
-                Err(e) => panic!("failed to open: {}", e),
-            };
+            let repo = tl.get_or(|| Repository::open(&repo_path).unwrap());
             let commit = repo.find_commit(Oid::from_bytes(rev).unwrap()).unwrap();
             let commit_tree = commit.tree().unwrap();
             commit_tree
@@ -164,9 +164,12 @@ fn referenced_oids_and_paths(repo: &Repository, repo_path: &str) -> Result<Refer
 
                     let oid = entry.id();
 
-                    if repo.find_object(oid, None).is_err() {
-                        // DashSet.insert returns true if key **did not** exist
-                        if broken_oids.insert(oid) {
+                    // DashSet.insert returns true if key **did not** exist, allowing us to skip
+                    // some disk I/O if we already know about an object
+                    if all_oids.insert(oid) {
+                        // ensure the OID actually resolves to something reasonable, otherwise
+                        // complain about it and move on
+                        if repo.find_object(oid, None).is_err() {
                             error!("entity {} is unreachable in ODB, skipping", oid);
                         }
 
@@ -227,11 +230,12 @@ fn render_objects(
         .into_bytes(),
     );
 
-    let _results: Vec<Result<()>> = refs
-        .oids
+    let tl = ThreadLocal::new();
+    #[allow(clippy::redundant_closure)]
+    refs.oids
         .par_iter()
         .map(|it| {
-            let repo = Repository::open(&repo_path)?;
+            let repo = tl.get_or(|| Repository::open(&repo_path).unwrap());
             let oid = it.key();
             let fname_cache_hash = it.value();
             let blob = repo.find_object(*oid, None)?.peel_to_blob()?;
@@ -285,7 +289,8 @@ fn render_objects(
 
             Ok(())
         })
-        .collect();
+        // for now I have no real interest in the results, so just discard them
+        .for_each(|x: Result<()>| drop(x));
 
     Ok(())
 }
