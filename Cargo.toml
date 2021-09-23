@@ -6,7 +6,7 @@ license = "CC0-1.0"
 authors = ["klardotsh <josh@klar.sh>"]
 
 [dependencies]
-#anyhow = "1.0"
+anyhow = "1.0"
 argh = "0.1"
 colog = "1.1"
 console = "0.14"

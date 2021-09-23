@@ -1,3 +1,4 @@
+extern crate anyhow;
 extern crate argh;
 extern crate colog;
 extern crate dashmap;
@@ -9,16 +10,20 @@ extern crate num_cpus;
 extern crate syntect;
 extern crate threadpool;
 
+use anyhow::Error;
 use argh::{FromArgValue, FromArgs};
 use dashmap::{DashMap, DashSet};
+use git2::{ObjectType, Oid, Repository, TreeWalkMode, TreeWalkResult};
 use indexmap::IndexSet;
-use std::fs::create_dir_all;
+use std::fs::{create_dir_all, File};
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use syntect::highlighting::ThemeSet;
-use syntect::html::{ClassStyle, ClassedHTMLGenerator};
+use syntect::html::{css_for_theme_with_class_style, ClassStyle, ClassedHTMLGenerator};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
+use threadpool::ThreadPool;
 
 /// gawsh generates a static HTML portrait of a Git repository
 #[derive(FromArgs, PartialEq, Debug)]
@@ -32,6 +37,13 @@ struct CmdArgs {
         default = "String::from(\".\")"
     )]
     repository: String,
+
+    #[argh(
+        option,
+        description = "output directory for rendered files, will be created if it doesn't exist",
+        default = "String::from(\".gawsh-output\")"
+    )]
+    output: String,
 
     #[argh(
         option,
@@ -79,6 +91,12 @@ impl FromArgValue for TemplatingBehavior {
     }
 }
 
+#[derive(Debug)]
+struct ReferencedOids {
+    oids: Arc<DashMap<Oid, usize>>,
+    filenames: Arc<RwLock<IndexSet<String>>>,
+}
+
 fn main() {
     let args: CmdArgs = argh::from_env();
 
@@ -95,7 +113,7 @@ fn main() {
 
     let repo_path = Arc::new(args.repository);
 
-    let repo = match git2::Repository::open(&*repo_path) {
+    let repo = match Repository::open(&*repo_path) {
         Ok(repo) => repo,
         Err(e) => panic!("failed to open: {}", e),
     };
@@ -105,89 +123,34 @@ fn main() {
         Err(e) => panic!("failed to figure out HEAD: {}", e),
     };
 
-    eprintln!(
+    info!(
         "HEAD is {} ({})",
         head.shorthand().or(Some("unprintable")).unwrap(),
         head.name().or(Some("unprintable")).unwrap()
     );
 
-    let pool = threadpool::ThreadPool::new(args.jobs);
-
-    // eventually this tool should be able to render just N>0 arbitrary commit(s) as specified at
-    // CLI, and not implicitly walk the entire HEAD tree, which means the naive shortcut of just
-    // rendering all objects in the ODB isn't suitable. instead, we need to keep track of the OIDs
-    // that are actually referenced in commits we actually need to render, and then queue up jobs
-    // for each of those objects
-    let (relevant_oids, fname_cache) = {
-        let broken_oids = Arc::new(DashSet::new());
-        let relevant_oids = Arc::new(DashMap::new());
-        let fname_cache = Arc::new(RwLock::new(IndexSet::new()));
-        let mut revwalk = repo.revwalk().unwrap();
-        revwalk.push_head().unwrap();
-        let revwalk = revwalk;
-
-        for rev in revwalk {
-            let broken_oids = broken_oids.clone();
-            let relevant_oids = relevant_oids.clone();
-            let fname_cache = fname_cache.clone();
-            let repo_path = repo_path.clone();
-
-            pool.execute(move || {
-                let repo = match git2::Repository::open(&*repo_path) {
-                    Ok(repo) => repo,
-                    Err(e) => panic!("failed to open: {}", e),
-                };
-
-                let rev = rev.unwrap();
-                let commit = repo.find_commit(rev).unwrap();
-                /*
-                eprintln!(
-                    "{} ({} by {}): {}",
-                    commit.id(),
-                    commit.author().when().seconds(),
-                    commit.author().name().unwrap(),
-                    commit.message().unwrap().trim()
-                );
-                */
-
-                let commit_tree = commit.tree().unwrap();
-                commit_tree
-                    .walk(git2::TreeWalkMode::PreOrder, |_, entry| {
-                        if entry.kind() == Some(git2::ObjectType::Tree) {
-                            return git2::TreeWalkResult::Ok;
-                        }
-
-                        let oid = entry.id();
-
-                        if repo.find_object(oid, None).is_err() {
-                            if broken_oids.insert(oid) {
-                                error!("entity {} is unreachable in ODB, skipping", oid);
-                            }
-
-                            return git2::TreeWalkResult::Ok;
-                        }
-
-                        let fname = entry.name().unwrap();
-
-                        let (cache_idx, _) =
-                            fname_cache.write().unwrap().insert_full(fname.to_string());
-
-                        relevant_oids.insert(oid, cache_idx);
-
-                        git2::TreeWalkResult::Ok
-                    })
-                    .unwrap();
-            });
-        }
-
-        pool.join();
-
-        (relevant_oids, fname_cache)
-    };
+    let pool = ThreadPool::new(args.jobs);
+    let referenced = referenced_oids_and_paths(&pool, &repo, &repo_path).unwrap();
+    let relevant_oids = referenced.oids;
+    let fname_cache = referenced.filenames;
 
     info!("rendering {} non-binary blob objects", relevant_oids.len());
 
-    create_dir_all("gawsh_output/oid").unwrap();
+    let output_root = PathBuf::from(&args.output);
+    let oid_target = {
+        let mut target = output_root.clone();
+        target.push("oid");
+        Arc::new(target)
+    };
+    let tree_target = {
+        let mut target = output_root.clone();
+        target.push("tree");
+        Arc::new(target)
+    };
+    drop(output_root); // this conveniently also shuts clippy up
+
+    create_dir_all(&*oid_target).unwrap();
+    create_dir_all(&*tree_target).unwrap();
 
     let class_style = if args.use_class_prefix {
         ClassStyle::SpacedPrefixed { prefix: "gawsh-" }
@@ -196,7 +159,7 @@ fn main() {
     };
     let theme_set = ThemeSet::load_defaults();
     let default_style = Arc::new(
-        syntect::html::css_for_theme_with_class_style(
+        css_for_theme_with_class_style(
             theme_set.themes.get("InspiredGitHub").unwrap(),
             class_style,
         )
@@ -204,6 +167,7 @@ fn main() {
     );
 
     for it in relevant_oids.iter() {
+        let oid_target = oid_target.clone();
         let oid = Arc::new(*it.key());
         let latest_fname_idx = Arc::new(*it.value());
         let repo_path = repo_path.clone();
@@ -212,51 +176,126 @@ fn main() {
         let default_style = default_style.clone();
 
         pool.execute(move || {
-            let repo = match git2::Repository::open(&*repo_path) {
+            let repo = match Repository::open(&*repo_path) {
                 Ok(repo) => repo,
                 Err(e) => panic!("failed to open: {}", e),
             };
-            let oid = git2::Oid::from_bytes(&*oid_bytes).unwrap();
+            let oid = Oid::from_bytes(&*oid_bytes).unwrap();
             let blob = repo.find_object(oid, None).unwrap().peel_to_blob().unwrap();
             let content = std::str::from_utf8(blob.content()).unwrap();
             let is_binary = blob.is_binary();
 
-            if !is_binary {
-                let fname_cache = fname_cache.read().unwrap();
-                let fname = fname_cache.get_index(*latest_fname_idx).unwrap();
-                let syntax_set = SyntaxSet::load_defaults_newlines();
-                let syntax = syntax_set
-                    .find_syntax_by_first_line(content)
-                    .or_else(|| {
-                        syntax_set.find_syntax_by_extension(
-                            std::path::Path::new(fname)
-                                .extension()
-                                .map(|ext| ext.to_str().unwrap())
-                                .or(Some(""))
-                                .unwrap(),
-                        )
-                    })
-                    .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
-                let mut html_generator =
-                    ClassedHTMLGenerator::new_with_class_style(syntax, &syntax_set, class_style);
-                for line in LinesWithEndings::from(content) {
-                    html_generator.parse_html_for_line_which_includes_newline(line);
-                }
-                let output_html = html_generator.finalize();
-
-                let output_filename = format!("gawsh_output/oid/{}.html", oid);
-                let mut output = std::fs::File::create(&output_filename).unwrap();
-                output.write_all(b"<style>").unwrap();
-                output.write_all(&default_style).unwrap();
-                output.write_all(b"</style>").unwrap();
-                output.write_all(b"<pre>").unwrap();
-                output.write_all(&output_html.into_bytes()).unwrap();
-                output.write_all(b"</pre>").unwrap();
-
-                debug!("rendered {}", output_filename);
+            if is_binary {
+                return;
             }
+
+            let fname_cache = fname_cache.read().unwrap();
+            let fname = fname_cache.get_index(*latest_fname_idx).unwrap();
+            let syntax_set = SyntaxSet::load_defaults_newlines();
+            let syntax = syntax_set
+                .find_syntax_by_first_line(content)
+                .or_else(|| {
+                    syntax_set.find_syntax_by_extension(
+                        Path::new(fname)
+                            .extension()
+                            .map(|ext| ext.to_str().unwrap())
+                            .or(Some(""))
+                            .unwrap(),
+                    )
+                })
+                .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
+            let mut html_generator =
+                ClassedHTMLGenerator::new_with_class_style(syntax, &syntax_set, class_style);
+            for line in LinesWithEndings::from(content) {
+                html_generator.parse_html_for_line_which_includes_newline(line);
+            }
+            let output_html = html_generator.finalize();
+
+            let output_filename = {
+                let mut target = (*oid_target).clone();
+                target.push(format!("{}.html", oid));
+                target
+            };
+            let mut output = File::create(&output_filename).unwrap();
+            output.write_all(b"<style>").unwrap();
+            output.write_all(&default_style).unwrap();
+            output.write_all(b"</style>").unwrap();
+            output.write_all(b"<pre>").unwrap();
+            output.write_all(&output_html.into_bytes()).unwrap();
+            output.write_all(b"</pre>").unwrap();
+
+            debug!("rendered {}", output_filename.to_str().unwrap());
         });
     }
 
     pool.join();
+}
+
+// eventually this tool should be able to render just N>0 arbitrary commit(s) as specified at
+// CLI, and not implicitly walk the entire HEAD tree, which means the naive shortcut of just
+// rendering all objects in the ODB isn't suitable. instead, we need to keep track of the OIDs
+// that are actually referenced in commits we actually need to render, and then queue up jobs
+// for each of those objects
+fn referenced_oids_and_paths(
+    pool: &ThreadPool,
+    repo: &Repository,
+    repo_path: &Arc<String>,
+) -> Result<ReferencedOids, Error> {
+    let broken_oids = Arc::new(DashSet::new());
+    let relevant_oids = Arc::new(DashMap::new());
+    let fname_cache = Arc::new(RwLock::new(IndexSet::new()));
+    let mut revwalk = repo.revwalk()?;
+    revwalk.push_head()?;
+    let revwalk = revwalk;
+
+    for rev in revwalk {
+        let broken_oids = broken_oids.clone();
+        let relevant_oids = relevant_oids.clone();
+        let fname_cache = fname_cache.clone();
+        let repo_path = repo_path.clone();
+
+        pool.execute(move || {
+            let repo = match Repository::open(&*repo_path) {
+                Ok(repo) => repo,
+                Err(e) => panic!("failed to open: {}", e),
+            };
+
+            let rev = rev.unwrap();
+            let commit = repo.find_commit(rev).unwrap();
+            let commit_tree = commit.tree().unwrap();
+            commit_tree
+                .walk(TreeWalkMode::PreOrder, |_, entry| {
+                    if entry.kind() == Some(ObjectType::Tree) {
+                        return TreeWalkResult::Ok;
+                    }
+
+                    let oid = entry.id();
+
+                    if repo.find_object(oid, None).is_err() {
+                        if broken_oids.insert(oid) {
+                            error!("entity {} is unreachable in ODB, skipping", oid);
+                        }
+
+                        return TreeWalkResult::Ok;
+                    }
+
+                    let fname = entry.name().unwrap();
+
+                    let (cache_idx, _) =
+                        fname_cache.write().unwrap().insert_full(fname.to_string());
+
+                    relevant_oids.insert(oid, cache_idx);
+
+                    TreeWalkResult::Ok
+                })
+                .unwrap();
+        });
+    }
+
+    pool.join();
+
+    Ok(ReferencedOids {
+        oids: relevant_oids,
+        filenames: fname_cache,
+    })
 }
