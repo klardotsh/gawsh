@@ -84,6 +84,18 @@ markup::define! {
 }
 
 /// gawsh generates a static HTML portrait of a Git repository
+// TODO?
+//
+// no-highlight: seems obvious. would be implied in a world where gawsh was built without the
+// syntect feature (assuming it were made modular at some point). rationale: hella faster, and some
+// folks just don't want highlighted files.
+//
+// no-history-links: don't generate links to past commits; only allow linking to objects referenced
+// within the same commit tree. rationale: this, combined with --depth=1, allows for fast(er),
+// cheap(er) rendering of the tip of a branch, but none of its ancestors (which are extremely
+// expensive), and (attempts to) ensure no broken links are generated (for example, "commit
+// abcde123 - parent: 321edcba" would _not_ hyperlink 321edcba with this flag, whereas the default
+// would, as it would assume it has or will generate(d) the tree portrait for that commit
 #[derive(FromArgs, PartialEq, Debug)]
 struct CmdArgs {
     /// be chatty
@@ -136,7 +148,6 @@ struct CmdArgs {
     #[argh(option, short = 'l', default = "DuplicateLinkageBehavior::Copy")]
     #[cfg(not(unix))]
     duplicate_linkage_behavior: DuplicateLinkageBehavior,
-    // TODO? no-highlight
 }
 
 /// To save disk space, gawsh can render Objects (the files stored in the Git repository) to
@@ -572,7 +583,7 @@ fn duplicate_file_on_disk<S: AsRef<Path>>(
     target: &S,
 ) -> Result<(), std::io::Error> {
     match behavior {
-        DuplicateLinkageBehavior::Copy => std::fs::copy(source, target).and_then(|_| Ok(())),
+        DuplicateLinkageBehavior::Copy => std::fs::copy(source, target).map(|_| ()),
         DuplicateLinkageBehavior::HardLink => std::fs::hard_link(source, target),
         #[cfg(unix)]
         DuplicateLinkageBehavior::SymLink => std::os::unix::fs::symlink(source, target),
