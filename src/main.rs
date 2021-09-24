@@ -90,6 +90,11 @@ struct CmdArgs {
     #[argh(switch, short = 'v')]
     verbose: bool,
 
+    /// limit history walk depth to N commits. defaults to 0, meaning no limit (recurse from HEAD
+    /// to the beginning of discoverable history)
+    #[argh(option, short = 'd', default = "0")]
+    depth: usize,
+
     /// maximum number of parallel jobs, defaults to number of CPU cores. bigger numbers are not
     /// always better, depending on the speed of your drives, amount of RAM, etc.
     #[argh(
@@ -112,9 +117,17 @@ struct CmdArgs {
     #[argh(option, short = 'o', default = "String::from(\".gawsh-output\")")]
     output: String,
 
-    /// templating behavior for embedding rendered Objects into tree files
+    /// templating behavior for embedding rendered Objects into tree files, must be one of
+    /// <disabled|caddy>. defaults to disabled, the only behavior that is guaranteed to work no
+    /// matter the destination.
     #[argh(option, default = "TemplatingBehavior::Disabled")]
     templating_behavior: TemplatingBehavior,
+
+    /// behavior for representing entirely-duplicated files on disk, must be one of
+    /// <copy|hardlink|symlink>. defaults to copy, the only behavior that is guaranteed to work no
+    /// matter the destination.
+    #[argh(option, short = 'l', default = "DuplicateLinkageBehavior::Copy")]
+    duplicate_linkage_behavior: DuplicateLinkageBehavior,
     // TODO? no-highlight
 }
 
@@ -141,6 +154,27 @@ impl FromArgValue for TemplatingBehavior {
             "caddy" => Ok(TemplatingBehavior::Caddy),
             other => Err(format!(
                 "unknown TemplatingBehavior {}, try disabled|caddy",
+                other
+            )),
+        }
+    }
+}
+
+#[derive(PartialEq, Debug)]
+enum DuplicateLinkageBehavior {
+    Copy,
+    HardLink,
+    SymLink,
+}
+
+impl FromArgValue for DuplicateLinkageBehavior {
+    fn from_arg_value(val: &str) -> core::result::Result<Self, String> {
+        match val.to_lowercase().as_str() {
+            "copy" => Ok(DuplicateLinkageBehavior::Copy),
+            "hardlink" => Ok(DuplicateLinkageBehavior::HardLink),
+            "symlink" => Ok(DuplicateLinkageBehavior::SymLink),
+            other => Err(format!(
+                "unknown DuplicateLinkageBehavior {}, try copy|hardlink|symlink",
                 other
             )),
         }
@@ -241,7 +275,7 @@ fn main() -> Result<()> {
 
     info!("parsing the entirety of history (abridged)");
 
-    let revs = serialized_revs_from_repo(&repo)?;
+    let revs = serialized_revs_from_repo(&repo, args.depth)?;
     info!("found {} revs in history tree", revs.len());
 
     let references = referenced_oids_and_paths(&args.repository, &revs)?;
@@ -342,16 +376,26 @@ fn do_it(
 /// figure out how to coerce the type system into believing they're [u8; 20]s) that Rayon can
 /// actually do something with, and then farm those out to worker threads (that then have to take
 /// the overhead of opening a Repository and deserializing the OID.... very efficient, wow)
-fn serialized_revs_from_repo(repo: &Repository) -> Result<SerializedOids> {
+fn serialized_revs_from_repo(repo: &Repository, depth: usize) -> Result<SerializedOids> {
     let revwalk = {
         let mut revwalk = repo.revwalk()?;
         revwalk.push_head()?;
         revwalk
     };
-    Ok(revwalk
-        .into_iter()
-        .map(|rev| (*rev.unwrap().as_bytes()).to_vec())
-        .collect()) // no impl for Map<Revwalk...> to rayon::IntoParallelRefIterator
+
+    if depth > 0 {
+        Ok(revwalk
+            .into_iter()
+            .take(depth)
+            .map(revwalk_mapper)
+            .collect()) // no impl for Map<Revwalk...> to rayon::IntoParallelRefIterator
+    } else {
+        Ok(revwalk.into_iter().map(revwalk_mapper).collect())
+    }
+}
+
+fn revwalk_mapper(rev: core::result::Result<Oid, git2::Error>) -> SerializedOid {
+    (*rev.unwrap().as_bytes()).to_vec()
 }
 
 // eventually this tool should be able to render just N>0 arbitrary commit(s) as specified at
