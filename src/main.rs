@@ -6,6 +6,7 @@ extern crate dashmap;
 extern crate git2;
 #[macro_use]
 extern crate log;
+extern crate markup;
 extern crate num_cpus;
 extern crate rayon;
 extern crate syntect;
@@ -25,6 +26,19 @@ use syntect::html::{css_for_theme_with_class_style, ClassStyle, ClassedHTMLGener
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 use thread_local::ThreadLocal;
+
+markup::define! {
+    RenderedObject(lines: Vec<String>) {
+        table {
+            @for (idx, line) in lines.iter().enumerate() {
+                tr {
+                    td { pre { @format!("{}", idx+1) } }
+                    td { pre { @markup::raw(line) } }
+                }
+            }
+        }
+    }
+}
 
 /// gawsh generates a static HTML portrait of a Git repository
 #[derive(FromArgs, PartialEq, Debug)]
@@ -128,13 +142,18 @@ fn main() -> Result<()> {
         head.name().or(Some("unprintable")).unwrap()
     );
 
-    let references = referenced_oids_and_paths(&repo, &args.repository)?;
+    let revs = serialized_revs_from_repo(&repo)?;
+    info!("found {} revs in history tree", revs.len());
+
+    let references = referenced_oids_and_paths(&args.repository, &revs)?;
     render_objects(
         args.use_class_prefix,
         &args.repository,
         &args.output,
         &references,
     )?;
+
+    info!("rendering trees");
 
     info!("well gawsh darn, looks like we're done here");
 
@@ -164,14 +183,12 @@ fn serialized_revs_from_repo(repo: &Repository) -> Result<SerializedOids> {
 // rendering all objects in the ODB isn't suitable. instead, we need to keep track of the OIDs
 // that are actually referenced in commits we actually need to render, and then queue up jobs
 // for each of those objects
-fn referenced_oids_and_paths(repo: &Repository, repo_path: &str) -> Result<ReferencedOids> {
+#[allow(clippy::ptr_arg)]
+fn referenced_oids_and_paths(repo_path: &str, revs: &SerializedOids) -> Result<ReferencedOids> {
     let all_oids = DashSet::new();
     let relevant_oids = DashMap::new();
     let fname_cache = DashMap::new();
     let tl = ThreadLocal::new();
-
-    let revs = serialized_revs_from_repo(repo)?;
-    info!("found {} revs in history tree", revs.len());
 
     revs.par_iter().for_each(|rev| {
         let repo = tl.get_or(|| Repository::open(&repo_path).unwrap());
@@ -298,9 +315,12 @@ fn render_objects(
             output.write_all(b"<style>")?;
             output.write_all(&default_style)?;
             output.write_all(b"</style>")?;
-            output.write_all(b"<pre>")?;
-            output.write_all(&output_html.into_bytes())?;
-            output.write_all(b"</pre>")?;
+
+            let rendering = RenderedObject {
+                lines: output_html.lines().map(String::from).collect(),
+            };
+
+            output.write_all(rendering.to_string().as_bytes())?;
 
             debug!(
                 "rendered {}",
