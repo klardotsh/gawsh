@@ -305,6 +305,7 @@ dependencies = [
  "dashmap",
  "git2",
  "log",
+ "num_cpus",
  "rayon",
  "syntect",
  "thread_local",

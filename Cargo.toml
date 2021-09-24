@@ -13,6 +13,7 @@ console = "0.14"
 dashmap = { version = "4.0", features = ["rayon"] }
 git2 = { version = "0.13", default_features = false }
 log = "0.4"
+num_cpus = "1.13"
 rayon = "1.5"
 thread_local = "1.1"
 

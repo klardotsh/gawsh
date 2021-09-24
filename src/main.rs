@@ -6,6 +6,7 @@ extern crate dashmap;
 extern crate git2;
 #[macro_use]
 extern crate log;
+extern crate num_cpus;
 extern crate rayon;
 extern crate syntect;
 extern crate thread_local;
@@ -28,31 +29,38 @@ use thread_local::ThreadLocal;
 /// gawsh generates a static HTML portrait of a Git repository
 #[derive(FromArgs, PartialEq, Debug)]
 struct CmdArgs {
-    #[argh(switch, description = "be chatty")]
+    /// be chatty
+    #[argh(switch, short = 'v')]
     verbose: bool,
 
+    /// maximum number of parallel jobs, defaults to number of CPU cores. bigger numbers are not
+    /// always better, depending on the speed of your drives, amount of RAM, etc.
     #[argh(
         option,
-        description = "repository to operate on",
+        short = 'j', // this matches make, cargo, and countless others
+        default = "num_cpus::get()"
+    )]
+    jobs: usize,
+
+    /// repository to operate on, defaults to current directory
+    #[argh(
+        option,
+        short = 'C', // this matches git and most community tools
         default = "String::from(\".\")"
     )]
     repository: String,
 
-    #[argh(
-        option,
-        description = "output directory for rendered files, will be created if it doesn't exist",
-        default = "String::from(\".gawsh-output\")"
-    )]
+    /// output directory for rendered files, will be created if it doesn't exist. defaults to
+    /// ./.gawsh-output
+    #[argh(option, short = 'o', default = "String::from(\".gawsh-output\")")]
     output: String,
 
-    #[argh(
-        option,
-        description = "templating behavior for embedding rendered Objects into tree files",
-        default = "TemplatingBehavior::Disabled"
-    )]
+    /// templating behavior for embedding rendered Objects into tree files
+    #[argh(option, default = "TemplatingBehavior::Disabled")]
     templating_behavior: TemplatingBehavior,
 
-    #[argh(switch, description = "prefix highlighting HTML classes with gawsh-")]
+    /// prefix highlighting HTML classes with gawsh- to avoid CSS collisions
+    #[argh(switch, short = 'P')]
     use_class_prefix: bool,
 }
 
@@ -92,6 +100,8 @@ struct ReferencedOids {
     filenames: InternedFilenames,
 }
 
+type SerializedOids = Vec<Vec<u8>>;
+
 fn main() -> Result<()> {
     let args: CmdArgs = argh::from_env();
 
@@ -105,6 +115,10 @@ fn main() -> Result<()> {
         },
     );
     clog.init();
+
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(args.jobs)
+        .build_global()?;
 
     let repo = Repository::open(&args.repository)?;
     let head = repo.head()?;
@@ -122,7 +136,27 @@ fn main() -> Result<()> {
         &references,
     )?;
 
+    info!("well gawsh darn, looks like we're done here");
+
     Ok(())
+}
+
+/// libgit2 isn't threadsafe as a general rule, so git2-rs likewise doesn't implement Send for...
+/// anything. so this is our hack: take the OID objects, serialize them to 20-byte u8 vectors
+/// (because, interestingly, these are [u8]s and not [u8; 20]s implementing Sized, and I can't
+/// figure out how to coerce the type system into believing they're [u8; 20]s) that Rayon can
+/// actually do something with, and then farm those out to worker threads (that then have to take
+/// the overhead of opening a Repository and deserializing the OID.... very efficient, wow)
+fn serialized_revs_from_repo(repo: &Repository) -> Result<SerializedOids> {
+    let revwalk = {
+        let mut revwalk = repo.revwalk()?;
+        revwalk.push_head()?;
+        revwalk
+    };
+    Ok(revwalk
+        .into_iter()
+        .map(|rev| (*rev.unwrap().as_bytes()).to_vec())
+        .collect()) // no impl for Map<Revwalk...> to rayon::IntoParallelRefIterator
 }
 
 // eventually this tool should be able to render just N>0 arbitrary commit(s) as specified at
@@ -134,57 +168,45 @@ fn referenced_oids_and_paths(repo: &Repository, repo_path: &str) -> Result<Refer
     let all_oids = DashSet::new();
     let relevant_oids = DashMap::new();
     let fname_cache = DashMap::new();
-    let revwalk = {
-        let mut revwalk = repo.revwalk()?;
-        revwalk.push_head()?;
-        revwalk
-    };
     let tl = ThreadLocal::new();
 
-    // libgit2 isn't threadsafe as a general rule, so git2-rs likewise doesn't implement Send
-    // for... anything. so this is our hack: take the OID objects, serialize them to 20-byte u8
-    // vectors (because, interestingly, these are [u8]s and not [u8; 20]s implementing Sized, and I
-    // can't figure out how to coerce the type system into believing they're [u8; 20]s) that Rayon
-    // can actually do something with, and then farm those out to worker threads (that then have to
-    // take the overhead of opening a Repository and deserializing the OID.... very efficient, wow)
-    revwalk
-        .into_iter()
-        .map(|rev| (*rev.unwrap().as_bytes()).to_vec())
-        .collect::<Vec<Vec<u8>>>() // no impl for Map<Revwalk...> to rayon::IntoParallelRefIterator
-        .par_iter()
-        .for_each(|rev| {
-            let repo = tl.get_or(|| Repository::open(&repo_path).unwrap());
-            let commit = repo.find_commit(Oid::from_bytes(rev).unwrap()).unwrap();
-            let commit_tree = commit.tree().unwrap();
-            commit_tree
-                .walk(TreeWalkMode::PreOrder, |_, entry| {
-                    if entry.kind() == Some(ObjectType::Tree) {
-                        return TreeWalkResult::Ok;
-                    }
+    let revs = serialized_revs_from_repo(repo)?;
+    info!("found {} revs in history tree", revs.len());
 
-                    let oid = entry.id();
+    revs.par_iter().for_each(|rev| {
+        let repo = tl.get_or(|| Repository::open(&repo_path).unwrap());
+        let commit = repo.find_commit(Oid::from_bytes(rev).unwrap()).unwrap();
+        let commit_tree = commit.tree().unwrap();
+        commit_tree
+            .walk(TreeWalkMode::PreOrder, |_, entry| {
+                if entry.kind() == Some(ObjectType::Tree) {
+                    return TreeWalkResult::Ok;
+                }
 
-                    // DashSet.insert returns true if key **did not** exist, allowing us to skip
-                    // some disk I/O if we already know about an object
-                    if all_oids.insert(oid) {
-                        // ensure the OID actually resolves to something reasonable, otherwise
-                        // complain about it and move on
-                        if repo.find_object(oid, None).is_err() {
-                            error!("entity {} is unreachable in ODB, skipping", oid);
-                        }
+                let oid = entry.id();
 
-                        return TreeWalkResult::Ok;
-                    }
+                // DashSet.insert returns false if key **did** already exist, allowing us to skip
+                // some disk I/O if we already know about an object
+                if !all_oids.insert(oid) {
+                    return TreeWalkResult::Ok;
+                }
 
-                    let fname = entry.name().unwrap().to_string();
-                    let cache_key = fname_cache.hash_usize(&fname);
-                    fname_cache.insert(cache_key, fname);
-                    relevant_oids.insert(oid, cache_key);
+                // ensure the OID actually resolves to something reasonable, otherwise
+                // complain about it and move on
+                if repo.find_object(oid, None).is_err() {
+                    error!("entity {} is unreachable in ODB, skipping", oid);
+                    return TreeWalkResult::Ok;
+                }
 
-                    TreeWalkResult::Ok
-                })
-                .unwrap();
-        });
+                let fname = entry.name().unwrap().to_string();
+                let cache_key = fname_cache.hash_usize(&fname);
+                fname_cache.insert(cache_key, fname);
+                relevant_oids.insert(oid, cache_key);
+
+                TreeWalkResult::Ok
+            })
+            .unwrap();
+    });
 
     Ok(ReferencedOids {
         oids: relevant_oids,
