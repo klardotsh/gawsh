@@ -127,6 +127,14 @@ struct CmdArgs {
     /// <copy|hardlink|symlink>. defaults to copy, the only behavior that is guaranteed to work no
     /// matter the destination.
     #[argh(option, short = 'l', default = "DuplicateLinkageBehavior::Copy")]
+    #[cfg(unix)]
+    duplicate_linkage_behavior: DuplicateLinkageBehavior,
+
+    /// behavior for representing entirely-duplicated files on disk, must be one of
+    /// <copy|hardlink>. defaults to copy, the only behavior that is guaranteed to work no
+    /// matter the destination.
+    #[argh(option, short = 'l', default = "DuplicateLinkageBehavior::Copy")]
+    #[cfg(not(unix))]
     duplicate_linkage_behavior: DuplicateLinkageBehavior,
     // TODO? no-highlight
 }
@@ -164,6 +172,7 @@ impl FromArgValue for TemplatingBehavior {
 enum DuplicateLinkageBehavior {
     Copy,
     HardLink,
+    #[cfg(unix)]
     SymLink,
 }
 
@@ -172,9 +181,16 @@ impl FromArgValue for DuplicateLinkageBehavior {
         match val.to_lowercase().as_str() {
             "copy" => Ok(DuplicateLinkageBehavior::Copy),
             "hardlink" => Ok(DuplicateLinkageBehavior::HardLink),
+            #[cfg(unix)]
             "symlink" => Ok(DuplicateLinkageBehavior::SymLink),
+            #[cfg(unix)]
             other => Err(format!(
                 "unknown DuplicateLinkageBehavior {}, try copy|hardlink|symlink",
+                other
+            )),
+            #[cfg(not(unix))]
+            other => Err(format!(
+                "unknown DuplicateLinkageBehavior {}, try copy|hardlink",
                 other
             )),
         }
@@ -258,12 +274,19 @@ fn main() -> Result<()> {
         Arc::new(target)
     };
     let tree_target = {
-        let mut target = output_root;
+        let mut target = output_root.clone();
         target.push("tree");
         Arc::new(target)
     };
+    let ref_target = {
+        let mut target = output_root.clone();
+        target.push("ref");
+        Arc::new(target)
+    };
+    drop(output_root);
     create_dir_all(&*oid_target)?;
     create_dir_all(&*tree_target)?;
+    create_dir_all(&*ref_target)?;
 
     let repo = Repository::open(&args.repository)?;
     let head = repo.head()?;
@@ -273,7 +296,14 @@ fn main() -> Result<()> {
         head.name().or(Some("unprintable")).unwrap()
     );
 
-    info!("parsing the entirety of history (abridged)");
+    info!(
+        "parsing the entirety of history (abridged){}",
+        if args.depth > 0 {
+            format!(", max depth {}", args.depth)
+        } else {
+            "".to_string()
+        }
+    );
 
     let revs = serialized_revs_from_repo(&repo, args.depth)?;
     info!("found {} revs in history tree", revs.len());
@@ -304,7 +334,7 @@ fn main() -> Result<()> {
                     .unwrap_or_else(|_| repo.find_tree(*oid).unwrap());
                 let objects = tree
                     .iter()
-                    .map(|entry| do_it(repo, entry, &subtrees))
+                    .map(|entry| renderable_tree_object_gross_side_effects(repo, entry, &subtrees))
                     .collect();
 
                 let rendering = TreeView {
@@ -336,7 +366,11 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn do_it(
+// for the love of god, get this subtree side effect bullshit out of here, return a tuple or
+// something
+//
+// TODO FIXME
+fn renderable_tree_object_gross_side_effects(
     repo: &Repository,
     entry: TreeEntry,
     subtrees: &DashSet<Vec<u8>>,
@@ -530,4 +564,17 @@ fn render_objects(repo_path: &str, output_target: PathBuf, refs: &ReferencedOids
         .for_each(|x: Result<()>| drop(x));
 
     Ok(())
+}
+
+fn duplicate_file_on_disk<S: AsRef<Path>>(
+    behavior: &DuplicateLinkageBehavior,
+    source: &S,
+    target: &S,
+) -> Result<(), std::io::Error> {
+    match behavior {
+        DuplicateLinkageBehavior::Copy => std::fs::copy(source, target).and_then(|_| Ok(())),
+        DuplicateLinkageBehavior::HardLink => std::fs::hard_link(source, target),
+        #[cfg(unix)]
+        DuplicateLinkageBehavior::SymLink => std::os::unix::fs::symlink(source, target),
+    }
 }

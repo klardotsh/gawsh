@@ -48,12 +48,15 @@ templating possibilities (and absorbing all the complexity that entails). Thus,
 here's the output of `gawsh --help`.
 
 ```
-Usage: gawsh [-v] [-j <jobs>] [-C <repository>] [-o <output>] [--templating-behavior <templating-behavior>] [-P]
+Usage: gawsh [-v] [-d <depth>] [-j <jobs>] [-C <repository>] [-o <output>] [--templating-behavior <templating-behavior>] [-l <duplicate-linkage-behavior>]
 
 gawsh generates a static HTML portrait of a Git repository
 
 Options:
   -v, --verbose     be chatty
+  -d, --depth       limit history walk depth to N commits. defaults to 0,
+                    meaning no limit (recurse from HEAD to the beginning of
+                    discoverable history)
   -j, --jobs        maximum number of parallel jobs, defaults to number of CPU
                     cores. bigger numbers are not always better, depending on
                     the speed of your drives, amount of RAM, etc.
@@ -62,10 +65,20 @@ Options:
                     doesn't exist. defaults to ./.gawsh-output
   --templating-behavior
                     templating behavior for embedding rendered Objects into tree
-                    files
+                    files, must be one of <disabled|caddy>. defaults to
+                    disabled, the only behavior that is guaranteed to work no
+                    matter the destination.
+  -l, --duplicate-linkage-behavior
+                    behavior for representing entirely-duplicated files on disk,
+                    must be one of <copy|hardlink|symlink>. defaults to copy,
+                    the only behavior that is guaranteed to work no matter the
+                    destination.
   --help            display usage information
 ```
 
+> Note that the `symlink` option of `--duplicate-linkage-behavior` is
+> unavaialable on non-Unix OSes including Windows. The help text above was
+> copied from a Unix build, but correctly excludes `symlink` on other OSes.
 
 ## Self-hostable alternatives
 
