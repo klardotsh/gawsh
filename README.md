@@ -63,9 +63,6 @@ Options:
   --templating-behavior
                     templating behavior for embedding rendered Objects into tree
                     files
-  -P, --use-class-prefix
-                    prefix highlighting HTML classes with gawsh- to avoid CSS
-                    collisions
   --help            display usage information
 ```
 

@@ -15,7 +15,7 @@ extern crate thread_local;
 use anyhow::Result;
 use argh::{FromArgValue, FromArgs};
 use dashmap::{DashMap, DashSet};
-use git2::{ObjectType, Oid, Repository, TreeWalkMode, TreeWalkResult};
+use git2::{ObjectType, Oid, Repository, TreeEntry, TreeWalkMode, TreeWalkResult};
 use rayon::prelude::*;
 use std::fs::{create_dir_all, File};
 use std::io::Write;
@@ -27,13 +27,56 @@ use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 use thread_local::ThreadLocal;
 
+// matches sr.ht, one longer than GitHub/Gitlab
+const PRETTY_OID_CHAR_LENGTH: usize = 8;
+
 markup::define! {
     RenderedObject(lines: Vec<String>) {
         table {
             @for (idx, line) in lines.iter().enumerate() {
-                tr {
-                    td { pre { @format!("{}", idx+1) } }
-                    td { pre { @markup::raw(line) } }
+                tr#{format!("L{}", idx+1)} {
+                    td."gawsh-line-number" {
+                        a[href=format!("#L{}", idx+1)] {
+                            pre { @format!("{}", idx+1) }
+                        }
+                    }
+                    td."gawsh-line-content-wrapper" {
+                        pre."gawsh-line-content" {
+                            @markup::raw(line)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    TreeView<'a>(
+        tree_oid: &'a Oid,
+        tree_alias: &'a Option<&'a str>,
+        objects: &'a Vec<Option<RenderableTreeObject>>,
+    ) {
+        div."gawsh-tree-header" {
+            @if let Some(alias) = tree_alias {
+                span."gawsh-tree-header-alias" { @alias }
+                span."gawsh-tree-header-aliased-commitish" {
+                    @format!("({})", pretty_oid(tree_oid))
+                }
+            } else {
+                span."gawsh-tree-header-unaliased-commitish" {
+                    @pretty_oid(tree_oid).to_string()
+                }
+            }
+        }
+        table."gawsh-tree-contents" {
+            @for obj in objects.iter() {
+                @if let Some(obj) = obj {
+                    tr."gawsh-tree-line" {
+                        td."gawsh-tree-line-name" {
+                            a[href=obj.link()] {
+                                @obj.name()
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -72,10 +115,7 @@ struct CmdArgs {
     /// templating behavior for embedding rendered Objects into tree files
     #[argh(option, default = "TemplatingBehavior::Disabled")]
     templating_behavior: TemplatingBehavior,
-
-    /// prefix highlighting HTML classes with gawsh- to avoid CSS collisions
-    #[argh(switch, short = 'P')]
-    use_class_prefix: bool,
+    // TODO? no-highlight
 }
 
 /// To save disk space, gawsh can render Objects (the files stored in the Git repository) to
@@ -86,6 +126,8 @@ struct CmdArgs {
 /// This functionality is disabled by default; all objects will simply be inline concatenated into
 /// referring files no matter the disk space cost, as this is the only guaranteed-safe-everywhere
 /// behavior that doesn't take runtime dependencies.
+///
+/// TODO determine if this is just bloat
 #[derive(PartialEq, Debug)]
 enum TemplatingBehavior {
     Disabled,
@@ -114,7 +156,48 @@ struct ReferencedOids {
     filenames: InternedFilenames,
 }
 
-type SerializedOids = Vec<Vec<u8>>;
+type SerializedOid = Vec<u8>;
+type SerializedOids = Vec<SerializedOid>;
+
+#[derive(Debug, Eq, Hash, PartialEq)]
+// this has to be pub to make markup.rs happy
+//
+// these should probably be interned somewhere much as filenames are
+pub enum RenderableTreeObject {
+    Tree { oid: Oid, name: String },
+    TextFile { oid: Oid, name: String },
+    BinaryFile { oid: Oid, name: String },
+}
+
+impl RenderableTreeObject {
+    // I give up trying to fix this lint
+    #[allow(clippy::needless_arbitrary_self_type)]
+    pub fn link(self: &Self) -> String {
+        match self {
+            // TODO FIXME
+            RenderableTreeObject::Tree { oid, .. } => format!("../tree/{}.html", oid),
+            RenderableTreeObject::TextFile { oid, .. }
+            | RenderableTreeObject::BinaryFile { oid, .. } => format!("../oid/{}.html", oid),
+        }
+    }
+
+    // I give up trying to fix this lint
+    #[allow(clippy::needless_arbitrary_self_type)]
+    pub fn name(self: &Self) -> &str {
+        match self {
+            RenderableTreeObject::Tree { name, .. }
+            | RenderableTreeObject::TextFile { name, .. }
+            | RenderableTreeObject::BinaryFile { name, .. } => name,
+        }
+    }
+}
+
+fn pretty_oid(oid: &Oid) -> String {
+    oid.to_string()
+        .chars()
+        .take(PRETTY_OID_CHAR_LENGTH)
+        .collect()
+}
 
 fn main() -> Result<()> {
     let args: CmdArgs = argh::from_env();
@@ -134,6 +217,20 @@ fn main() -> Result<()> {
         .num_threads(args.jobs)
         .build_global()?;
 
+    let output_root = PathBuf::from(&args.output);
+    let oid_target = {
+        let mut target = output_root.clone();
+        target.push("oid");
+        Arc::new(target)
+    };
+    let tree_target = {
+        let mut target = output_root;
+        target.push("tree");
+        Arc::new(target)
+    };
+    create_dir_all(&*oid_target)?;
+    create_dir_all(&*tree_target)?;
+
     let repo = Repository::open(&args.repository)?;
     let head = repo.head()?;
     info!(
@@ -142,22 +239,101 @@ fn main() -> Result<()> {
         head.name().or(Some("unprintable")).unwrap()
     );
 
+    info!("parsing the entirety of history (abridged)");
+
     let revs = serialized_revs_from_repo(&repo)?;
     info!("found {} revs in history tree", revs.len());
 
     let references = referenced_oids_and_paths(&args.repository, &revs)?;
-    render_objects(
-        args.use_class_prefix,
-        &args.repository,
-        &args.output,
-        &references,
-    )?;
+    render_objects(&args.repository, oid_target.to_path_buf(), &references)?;
 
-    info!("rendering trees");
+    info!("recursively rendering {} commit trees", revs.len());
+
+    let tl = ThreadLocal::new();
+    let mut revset = DashSet::with_capacity(revs.len());
+
+    for rev in revs {
+        revset.insert(rev);
+    }
+
+    loop {
+        let subtrees = DashSet::new();
+        #[allow(clippy::redundant_closure)]
+        revset
+            .par_iter()
+            .map(|rev| {
+                let oid = &Oid::from_bytes(rev.key())?;
+                let repo = tl.get_or(|| Repository::open(&args.repository).unwrap());
+                let tree = repo
+                    .find_commit(*oid)
+                    .and_then(|commit| commit.tree())
+                    .unwrap_or_else(|_| repo.find_tree(*oid).unwrap());
+                let objects = tree
+                    .iter()
+                    .map(|entry| do_it(repo, entry, &subtrees))
+                    .collect();
+
+                let rendering = TreeView {
+                    tree_oid: oid,
+                    tree_alias: &None,
+                    objects: &objects,
+                };
+                let output_filename = {
+                    let mut target = (*tree_target).clone();
+                    target.push(format!("{}.html", oid));
+                    target
+                };
+                let mut output = File::create(&output_filename)?;
+                output.write_all(rendering.to_string().as_bytes())?;
+                Ok(())
+            })
+            // for now I have no real interest in the results, so just discard them
+            .for_each(|x: Result<()>| drop(x));
+
+        if subtrees.is_empty() {
+            break;
+        }
+
+        revset = subtrees;
+    }
 
     info!("well gawsh darn, looks like we're done here");
 
     Ok(())
+}
+
+fn do_it(
+    repo: &Repository,
+    entry: TreeEntry,
+    subtrees: &DashSet<Vec<u8>>,
+) -> Option<RenderableTreeObject> {
+    match entry.kind() {
+        Some(ObjectType::Tree) => {
+            subtrees.insert(entry.id().as_bytes().to_vec());
+
+            Some(RenderableTreeObject::Tree {
+                oid: entry.id(),
+                name: entry.name().unwrap().to_string(),
+            })
+        }
+        Some(ObjectType::Blob) => {
+            let blob = entry.to_object(repo).unwrap().peel_to_blob().unwrap();
+            let blob_id = blob.id();
+
+            if blob.is_binary() {
+                Some(RenderableTreeObject::BinaryFile {
+                    oid: blob_id,
+                    name: entry.name().unwrap().to_string(),
+                })
+            } else {
+                Some(RenderableTreeObject::TextFile {
+                    oid: blob_id,
+                    name: entry.name().unwrap().to_string(),
+                })
+            }
+        }
+        _ => None,
+    }
 }
 
 /// libgit2 isn't threadsafe as a general rule, so git2-rs likewise doesn't implement Send for...
@@ -231,35 +407,10 @@ fn referenced_oids_and_paths(repo_path: &str, revs: &SerializedOids) -> Result<R
     })
 }
 
-fn render_objects(
-    use_class_prefix: bool,
-    repo_path: &str,
-    output_path: &str,
-    refs: &ReferencedOids,
-) -> Result<()> {
+fn render_objects(repo_path: &str, output_target: PathBuf, refs: &ReferencedOids) -> Result<()> {
     info!("rendering {} non-binary blob objects", refs.oids.len());
 
-    let output_root = PathBuf::from(output_path);
-    let oid_target = {
-        let mut target = output_root.clone();
-        target.push("oid");
-        Arc::new(target)
-    };
-    let tree_target = {
-        let mut target = output_root.clone();
-        target.push("tree");
-        Arc::new(target)
-    };
-    drop(output_root); // this conveniently also shuts clippy up
-
-    create_dir_all(&*oid_target)?;
-    create_dir_all(&*tree_target)?;
-
-    let class_style = if use_class_prefix {
-        ClassStyle::SpacedPrefixed { prefix: "gawsh-" }
-    } else {
-        ClassStyle::Spaced
-    };
+    let class_style = ClassStyle::SpacedPrefixed { prefix: "gawsh-" };
     let theme_set = ThemeSet::load_defaults();
     let default_style = Arc::new(
         css_for_theme_with_class_style(
@@ -307,7 +458,7 @@ fn render_objects(
             let output_html = html_generator.finalize();
 
             let output_filename = {
-                let mut target = (*oid_target).clone();
+                let mut target = output_target.clone();
                 target.push(format!("{}.html", oid));
                 target
             };
