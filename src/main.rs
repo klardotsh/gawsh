@@ -50,11 +50,15 @@ markup::define! {
         }
     }
 
-    TreeView<'a>(
+    TreeView<'a, F>(
         tree_oid: &'a Oid,
         tree_alias: &'a Option<&'a str>,
         objects: &'a Vec<Option<RenderableTreeObject>>,
-    ) {
+        parent: Option<&'a Oid>,
+        tree_link_generator: Option<F>,
+    )
+        where F: Fn(&'a Oid) -> String
+    {
         div."gawsh-tree-header" {
             @if let Some(alias) = tree_alias {
                 span."gawsh-tree-header-alias" { @alias }
@@ -63,7 +67,23 @@ markup::define! {
                 }
             } else {
                 span."gawsh-tree-header-unaliased-commitish" {
-                    @pretty_oid(tree_oid).to_string()
+                    @pretty_oid(tree_oid)
+                }
+            }
+
+            @if let Some(parent) = parent {
+                span."gawsh-tree-header-parent-wrapper" {
+                    "(parent: "
+                    span."gawsh-tree-header-parent-commitish" {
+                        @if let Some(gen) = tree_link_generator {
+                            a[href=gen(parent)] {
+                                @pretty_oid(parent)
+                            }
+                        } else {
+                                @pretty_oid(parent)
+                        }
+                    }
+                    ")"
                 }
             }
         }
@@ -72,7 +92,11 @@ markup::define! {
                 @if let Some(obj) = obj {
                     tr."gawsh-tree-line" {
                         td."gawsh-tree-line-name" {
-                            a[href=obj.link()] {
+                            @if let Some(link) = obj.link() {
+                                a[href=link] {
+                                    @obj.name()
+                                }
+                            } else {
                                 @obj.name()
                             }
                         }
@@ -89,13 +113,6 @@ markup::define! {
 // no-highlight: seems obvious. would be implied in a world where gawsh was built without the
 // syntect feature (assuming it were made modular at some point). rationale: hella faster, and some
 // folks just don't want highlighted files.
-//
-// no-history-links: don't generate links to past commits; only allow linking to objects referenced
-// within the same commit tree. rationale: this, combined with --depth=1, allows for fast(er),
-// cheap(er) rendering of the tip of a branch, but none of its ancestors (which are extremely
-// expensive), and (attempts to) ensure no broken links are generated (for example, "commit
-// abcde123 - parent: 321edcba" would _not_ hyperlink 321edcba with this flag, whereas the default
-// would, as it would assume it has or will generate(d) the tree portrait for that commit
 #[derive(FromArgs, PartialEq, Debug)]
 struct CmdArgs {
     /// be chatty
@@ -103,7 +120,9 @@ struct CmdArgs {
     verbose: bool,
 
     /// limit history walk depth to N commits. defaults to 0, meaning no limit (recurse from HEAD
-    /// to the beginning of discoverable history)
+    /// to the beginning of discoverable history). this allows for rendering only the tip of a
+    /// branch, particularly useful if ancestors have already been rendered (or with
+    /// --no-history-links)
     #[argh(option, short = 'd', default = "0")]
     depth: usize,
 
@@ -148,6 +167,12 @@ struct CmdArgs {
     #[argh(option, short = 'l', default = "DuplicateLinkageBehavior::Copy")]
     #[cfg(not(unix))]
     duplicate_linkage_behavior: DuplicateLinkageBehavior,
+
+    /// don't generate links to past commits; only allow linking to objects referenced
+    /// within the same commit tree. generally useful only if combined with --depth=1, to render
+    /// just the tip of HEAD but no ancestors, while also ensuring no broken links
+    #[argh(switch, short = 'H')]
+    no_history_links: bool,
 }
 
 /// To save disk space, gawsh can render Objects (the files stored in the Git repository) to
@@ -233,12 +258,11 @@ pub enum RenderableTreeObject {
 impl RenderableTreeObject {
     // I give up trying to fix this lint
     #[allow(clippy::needless_arbitrary_self_type)]
-    pub fn link(self: &Self) -> String {
+    pub fn link(self: &Self) -> Option<String> {
         match self {
-            // TODO FIXME
-            RenderableTreeObject::Tree { oid, .. } => format!("../tree/{}.html", oid),
-            RenderableTreeObject::TextFile { oid, .. }
-            | RenderableTreeObject::BinaryFile { oid, .. } => format!("../oid/{}.html", oid),
+            RenderableTreeObject::Tree { oid, .. } => Some(format!("../tree/{}.html", oid)),
+            RenderableTreeObject::TextFile { oid, .. } => Some(format!("../oid/{}.html", oid)),
+            RenderableTreeObject::BinaryFile { .. } => None,
         }
     }
 
@@ -331,6 +355,8 @@ fn main() -> Result<()> {
         revset.insert(rev);
     }
 
+    let history_links = !args.no_history_links;
+
     loop {
         let subtrees = DashSet::new();
         #[allow(clippy::redundant_closure)]
@@ -348,10 +374,24 @@ fn main() -> Result<()> {
                     .map(|entry| renderable_tree_object_gross_side_effects(repo, entry, &subtrees))
                     .collect();
 
+                let parent = repo
+                    .find_commit(*oid)
+                    .map(|commit| commit.parent_id(0).ok())
+                    .unwrap_or(None);
                 let rendering = TreeView {
                     tree_oid: oid,
                     tree_alias: &None,
                     objects: &objects,
+                    parent: parent.as_ref(),
+                    tree_link_generator: if history_links {
+                        Some(|target_oid| {
+                            let mut target = (*tree_target).clone();
+                            target.push(format!("./{}.html", target_oid));
+                            target.as_path().display().to_string()
+                        })
+                    } else {
+                        None
+                    },
                 };
                 let output_filename = {
                     let mut target = (*tree_target).clone();
@@ -371,6 +411,28 @@ fn main() -> Result<()> {
 
         revset = subtrees;
     }
+
+    // TODO no hard-code
+    info!(
+        "linking {} refs (branches, tags, etc.) to associated commit trees",
+        1
+    );
+    let head_source = {
+        let mut tgt = (*tree_target).clone();
+        tgt.push(format!("{}.html", head.target().unwrap()));
+        tgt
+    };
+    let head_target = {
+        let mut tgt = (*ref_target).clone();
+        tgt.push(format!(
+            "{}.html",
+            head.shorthand().or(Some("unprintable")).unwrap()
+        ));
+        tgt
+    };
+    debug!("{:?}", head_source);
+    debug!("{:?}", head_target);
+    duplicate_file_on_disk(&args.duplicate_linkage_behavior, &head_source, &head_target)?;
 
     info!("well gawsh darn, looks like we're done here");
 
