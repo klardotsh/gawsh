@@ -439,11 +439,15 @@ fn main() -> Result<()> {
     #[cfg(not(feature = "workspace-compression"))]
     let db = sled::Config::default()
         .path(".gawsh.sled".to_owned())
+        .mode(sled::Mode::HighThroughput)
+        .flush_every_ms(Some(2000))
         .open()?;
 
     #[cfg(feature = "workspace-compression")]
     let db = sled::Config::default()
         .path(".gawsh.sled".to_owned())
+        .mode(sled::Mode::HighThroughput)
+        .flush_every_ms(Some(2000))
         .use_compression(!args.no_workspace_compression)
         .open()?;
 
@@ -727,10 +731,13 @@ fn render_text_blob(
         return Ok(());
     }
 
-    let content = std::str::from_utf8(blob.content())?;
+    // already in testing I ran into repos with non-UTF8-encodable content, so on those rare
+    // occasions we'll eat the conversion costs to insert the replacement characters
+    let content = String::from_utf8_lossy(blob.content());
+
     let syntax_set = SyntaxSet::load_defaults_newlines();
     let syntax = syntax_set
-        .find_syntax_by_first_line(content)
+        .find_syntax_by_first_line(&content)
         .or_else(|| {
             syntax_set.find_syntax_by_extension(
                 Path::new(filename)
@@ -740,21 +747,22 @@ fn render_text_blob(
             )
         })
         .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
-    let mut html_generator =
-        ClassedHTMLGenerator::new_with_class_style(syntax, &syntax_set, *hl_class_style);
-    for line in LinesWithEndings::from(content) {
-        html_generator.parse_html_for_line_which_includes_newline(line);
-    }
-    let output_html = html_generator.finalize();
-
-    let rendering = RenderedObject {
-        lines: &output_html
-            .lines()
-            .map(String::from)
-            .collect::<Vec<String>>(),
+    let rendered_object = {
+        let mut html_generator =
+            ClassedHTMLGenerator::new_with_class_style(syntax, &syntax_set, *hl_class_style);
+        for line in LinesWithEndings::from(&content) {
+            html_generator.parse_html_for_line_which_includes_newline(line);
+        }
+        let output_html = html_generator.finalize();
+        RenderedObject {
+            lines: &output_html
+                .lines()
+                .map(String::from)
+                .collect::<Vec<String>>(),
+        }
     };
 
-    db.insert(oid, rendering.to_string().as_bytes())?;
+    db.insert(oid.as_bytes(), rendered_object.to_string().as_bytes())?;
 
     Ok(())
 }
