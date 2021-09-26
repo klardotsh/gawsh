@@ -8,6 +8,7 @@ authors = ["klardotsh <josh@klar.sh>"]
 [dependencies]
 anyhow = "1.0"
 argh = "0.1"
+chrono = "0.4"
 colog = "1.1"
 console = "0.14"
 dashmap = { version = "4.0", features = ["rayon"] }
@@ -16,9 +17,14 @@ log = "0.4"
 markup = "0.12"
 num_cpus = "1.13"
 rayon = "1.5"
+sled = "0.34"
 thread_local = "1.1"
 
 [dependencies.syntect]
 version = "4.6"
 default-features = false
 features = ["parsing", "assets", "html", "dump-load-rs", "regex-fancy"]
+
+[features]
+default = ["workspace-compression"]
+workspace-compression = ["sled/compression"]
