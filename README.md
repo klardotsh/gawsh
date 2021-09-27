@@ -1,57 +1,54 @@
 # gawsh: a static site generator to peruse git repositories
 
-> Gawsh darn, that's a lot of HTML...
+> well gawsh darn, that's a lot of HTML...
 
-`gawsh` is a highly opinionated tool to generate simple, static page fragments
-used to browse a Git repository. It's meant to compliment, but not integrate
-directly with, existing static site generators, allowing a low-friction visual
-transition from, perhaps, a blog to ones' code. By extension, it seamlessly
-supports being embedded within a blog or blog post, because _it just generates
-static page fragments_.
+`gawsh` generates a static HTML portrait of a Git repository, outputting
+standards-compliant HTML fragments (or, optionally, simple-but-full HTML5
+pages) to allow basic perusing of Git repositories on the web. It's designed to
+(TODO FILL THE REST IN)
 
-This tool isn't the first player in this space, though it wasn't far off,
-somehow. The most feature-complete alternative I've come across is
-[stagit](https://codemadness.org/stagit.html), which is also excellent and
-worth your consideration.
+### Features
 
-This tool makes no attempt to be a social network, to understand the concepts
-of "users" or "accounts", to manage or otherwise do anything to a repository
-that might require write access, or to deploy anything to anywhere. It also
-does not, and will not, introduce analytics, telemetry, or other forms of
-tracking to its output. If you're looking for any of the above, consider
-another service. Here's a few that are libre software, though not all of these
-do all (or even most) of the above:
+- output files should be legible, even if not perfect, in anything capable of
+  rendering basic, standards-compliant HTML5 fragments.  In general, this means
+  `gawsh` sites should work to some basic degree (or better) in browsers like
+  [Lynx](https://invisible-island.net/lynx/) or
+  [Netsurf](https://www.netsurf-browser.org/)
 
-- [Gitea](https://gitea.com/), or perhaps a hosted version thereof, for example
-  [Codeberg](https://codeberg.org/)
-- [Gogs](https://gogs.io/)
-- [Sourcehut](https://sourcehut.org/)
-- [cgit](https://git.zx2c4.com/cgit/)
-- [GitLab](https://gitlab.com/)
+### Non-Features
+
+- anything related to social networking, popularity, or for that matter,
+  anything that requires a deeper understanding of a "user" than the name
+  and/or email address associated with a commit in the commit log
+
+- anything related to analytics, telemetry, or other forms of user-agent
+  tracking
+
+- anything related to standing up Git repository hosting in general: Bring Your
+  Own Repo
+
+- anything related to deployment, CI/CD, etc., however examples are provided in
+  the documentation on how to set up such contraptions yourself
 
 ## Getting Started
 
-_This section reserved, to be filled in eventually..._
+TODO: Fill this in
 
-`gawsh` has very little configuration of its own, and does not have a config
-file. Its few options are all passed on the command line:
+## Self-hostable alternatives
 
-- help text goes here
+### Static Generation
 
-## Where can I use it?
+- [stagit](https://codemadness.org/stagit.html) is also excellent and worth
+  your consideration. It makes a few different tradeoffs regarding features and
+  performance, but was the primary influence for `gawsh`
 
-`gawsh` should generally run anywhere a Rust 1.51+ compiler can target against
-any Git repository `libgit2` can understand, and its output is plain UTF-8 text
-you can upload to just about anywhere you want. Yep, even that FTP host you
-last used in 1999. It doesn't integrate with any CI systems or, for example,
-GitHub Pages, out of the box - that's left as an exercise to the reader, or to
-some other program, probably by some other author.
+### Dynamic (CGI/Web Apps)
 
-On the viewing end, the output files should be legible, even if not perfect, in
-anything capable of rendering basic, standards-compliant HTML5 fragments. In
-general, this means `gawsh` sites should work to some basic degree (or better)
-in browsers like [Lynx](https://invisible-island.net/lynx/) or
-[Netsurf](https://www.netsurf-browser.org/).
+- [cgit](https://git.zx2c4.com/cgit/)
+- [Gitea](https://gitea.com/)
+- [Gogs](https://gogs.io/)
+- [Sourcehut](https://sourcehut.org/)
+- [GitLab](https://gitlab.com/)
 
 ## Copying, Contributing, and Legal
 
@@ -63,9 +60,8 @@ you're free to use it for any purpose, in any context, and without letting me
 know.
 
 Contributions will be considered, but are not guaranteed to be merged for any
-reason or no reason at all. By submitting a contribution to `gawsh`, you
-assert the following (this is the [Unlicense
-waiver](https://unlicense.org/WAIVER)):
+reason or no reason at all. By submitting a contribution to `gawsh`, you assert
+the following (this is the [Unlicense waiver](https://unlicense.org/WAIVER)):
 
 > I dedicate any and all copyright interest in this software to the
 > public domain. I make this dedication for the benefit of the public at

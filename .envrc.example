@@ -1,3 +1,0 @@
-export DOCKER_BUILDKIT=1
-
-use flake
